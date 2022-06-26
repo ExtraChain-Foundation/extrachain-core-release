@@ -1,4 +1,4 @@
-﻿/*
+/*
  * ExtraChain Core
  * Copyright (C) 2020 ExtraChain Foundation <extrachain@gmail.com>
  *
@@ -241,21 +241,21 @@ void NetworkManager::sendMessage(const std::string &serialized_message, Config::
         switch (typeSend) {
         case Config::Net::TypeSend::Except:
             return socket_identifier != receiver_identifier;
-            break;
         case Config::Net::TypeSend::Focused:
             return socket_identifier == receiver_identifier;
-            break;
         case Config::Net::TypeSend::All:
             return true;
-            break;
         default:
             return false;
-            break;
         }
     };
 
     for (const auto &service : qAsConst(m_connections)) {
-        bool isSend = isSendCheck(service->identifier().toStdString());
+        const auto identifier = service->identifier().toStdString();
+//        if (identifier == receiver_identifier) {
+//            continue;
+//        }
+        bool isSend = isSendCheck(identifier);
         if (!isSend)
             continue;
         if (service->isActive() && service->sendType() == SocketService::SendType::All)
@@ -333,11 +333,18 @@ bool NetworkManager::checkMsgCount(const QByteArray &msg) {
 }
 
 void NetworkManager::messageReceived(const std::string &message, const std::string &identifier) {
+//    if (m_messages.contains(identifier)) {
+//        qDebug() << "[[Network Manager] current message contains in messages by identifier ";
+//        return;
+//    }
+
     if (!checkMsgCount(QByteArray::fromStdString(message))) { // TODO: remove byte array
         qDebug()
             << "[Network Manager] checkMsgCount have returned false: such message has been already added";
         return;
     }
+
+    m_messages[identifier] = message;
 
     std::string_view msg = std::string_view(message).substr(0, message.size() - 64);
     std::string_view sign = std::string_view(message).substr(message.size() - 64, 64);
@@ -371,8 +378,9 @@ void NetworkManager::messageReceived(const std::string &message, const std::stri
     if (Network::networkDebug) {
         msgpack::object_handle oh = msgpack::unpack(serialized.data(), serialized.size());
         msgpack::object deserialized = oh.get();
-        std::cout << "[Network Message] Received: type " << int(type) << ", status " << int(status) << ", id "
-                  << messId << ", body: " << deserialized << std::endl;
+        qDebug() << fmt::format("[Network Message] Received: type {}, status {}, id {}, body: {}", type,
+                                status, messId, (std::stringstream() << deserialized).str())
+                        .c_str();
     }
 #endif
 
@@ -413,7 +421,7 @@ void NetworkManager::messageReceived(const std::string &message, const std::stri
             node.dfs()->sendDirData(actorId, 0, messageId);
         } else if (status == MessageStatus::Response) {
             auto [actorId, dirRows] =
-                MessagePack::deserialize<std::pair<ActorId, std::vector<DFS::Packets::DirRow>>>(serialized);
+                MessagePack::deserialize<std::pair<ActorId, std::vector<DFSP::DirRow>>>(serialized);
             node.dfs()->addDirData(actorId, dirRows);
         }
         break;
@@ -424,37 +432,37 @@ void NetworkManager::messageReceived(const std::string &message, const std::stri
         break;
     }
     case MessageType::DfsAddFile: {
-        auto msg = MessagePack::deserialize<DFS::Packets::AddFileMessage>(serialized);
+        auto msg = MessagePack::deserialize<DFSP::AddFileMessage>(serialized);
         node.dfs()->addFile(msg, true);
         break;
     }
     case MessageType::DfsRequestFile: {
-        auto [actorId, fileHash] = MessagePack::deserialize<std::pair<ActorId, std::string>>(serialized);
-        node.dfs()->sendFile(actorId, fileHash, messageId);
+        auto [actorId, fileName] = MessagePack::deserialize<std::pair<ActorId, std::string>>(serialized);
+        node.dfs()->sendFile(actorId, fileName, messageId);
         break;
     }
     case MessageType::DfsRequestFileSegment: {
-        auto msg = MessagePack::deserialize<DFS::Packets::RequestFileSegmentMessage>(serialized);
+        auto msg = MessagePack::deserialize<DFSP::RequestFileSegmentMessage>(serialized);
         node.dfs()->sendFragment(msg, messageId);
         break;
     }
     case MessageType::DfsAddSegment: {
-        auto msg = MessagePack::deserialize<DFS::Packets::EditSegmentMessage>(serialized);
+        auto msg = MessagePack::deserialize<DFSP::SegmentMessage>(serialized);
         node.dfs()->addFragment(msg);
         break;
     }
     case MessageType::DfsEditSegment: {
-        auto msg = MessagePack::deserialize<DFS::Packets::EditSegmentMessage>(serialized);
+        auto msg = MessagePack::deserialize<DFSP::SegmentMessage>(serialized);
         node.dfs()->insertFragment(msg);
         break;
     }
     case MessageType::DfsDeleteSegment: {
-        auto msg = MessagePack::deserialize<DFS::Packets::DeleteSegmentMessage>(serialized);
+        auto msg = MessagePack::deserialize<DFSP::DeleteSegmentMessage>(serialized);
         node.dfs()->deleteFragment(msg);
         break;
     }
     case MessageType::DfsRemoveFile: {
-        auto msg = MessagePack::deserialize<DFS::Packets::RemoveFileMessage>(serialized);
+        auto msg = MessagePack::deserialize<DFSP::RemoveFileMessage>(serialized);
         node.dfs()->removeFile(msg);
         break;
     }
