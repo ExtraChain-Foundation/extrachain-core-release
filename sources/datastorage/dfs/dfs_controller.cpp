@@ -1,9 +1,4 @@
 #include "datastorage/dfs/dfs_controller.h"
-#include "datastorage/dfs/fragment_storage.h"
-#include "datastorage/dfs/historical_chain.h"
-#include "network/network_manager.h"
-#include <QtConcurrent>
-#include <boost/algorithm/string.hpp>
 
 DfsController::DfsController(ExtraChainNode &node, QObject *parent)
     : QObject(parent)
@@ -15,6 +10,7 @@ DfsController::DfsController(ExtraChainNode &node, QObject *parent)
     dirsFile.query(DFST::DirsFile::CreateTableQuery);
 
     m_sizeTaken = calculateSizeTaken();
+    m_totalDfsSize = calculateFilesSize();
     qDebug() << fmt::format("[Dfs] Started. Current size: {}, available: {}", m_sizeTaken, bytesAvailable())
                     .c_str();
 }
@@ -139,6 +135,7 @@ std::string DfsController::addLocalFile(const Actor<KeyPrivate> &actor, const st
 
     actrDirFile.close();
     m_sizeTaken += fileSize;
+    m_totalDfsSize += fileSize;
     DBConnector dirsFile(DFSB::dirsPath);
     dirsFile.open();
     dirsFile.replace(DFST::DirsFile::TableName,
@@ -342,11 +339,18 @@ void DfsController::addListFiles(const QStringList &files) {
     const auto actor = node.accountController()->mainActor();
     ThreadAddFiles addFilesThread(this, actor, files);
     connect(&addFilesThread, &ThreadAddFiles::added, this,
-            [&](DFSP::AddFileMessage msg, std::string filePath) {
-                qDebug() << "added file: " << msg.FileName.c_str();
+            [&](DFSP::AddFileMessage msg, std::string filePath, std::string scriptPath) {
                 insertToFiles(msg);
                 emit added(msg.Actor, msg.FileName, msg.Path, msg.Size);
                 emit resultAddFile("", QString::fromStdString(filePath));
+                if (!scriptPath.empty()) {
+                    //                    Transaction transaction;
+                    //                    transaction.setData(MessagePack::serialize(
+                    //                        TransactionData { .hash = transaction.getHash(), .path =
+                    //                        msg.FileHash }));
+                    //                    node.network()->send_message(transaction,
+                    //                    MessageType::BlockchainTransaction);
+                }
             });
 
     connect(&addFilesThread, &ThreadAddFiles::sendMessage, this,
@@ -476,6 +480,10 @@ uint64_t DfsController::sizeTaken() const {
     return m_sizeTaken;
 }
 
+uint64_t DfsController::totalDfsSize() const {
+    return m_totalDfsSize;
+}
+
 void DfsController::increaseSizeTaken(uintmax_t value) {
     m_sizeTaken += value;
 }
@@ -555,7 +563,7 @@ void DfsController::exportFile(const std::string &pathTo, const std::string &pat
     }
 }
 
-uint64_t DfsController::calculateSizeTaken(const std::string &folder) {
+uint64_t DfsController::calculateSizeTaken(const std::string &folder) const {
     uint64_t size = 0;
 
     for (std::filesystem::directory_entry const &entry : std::filesystem::directory_iterator(folder)) {
@@ -566,6 +574,35 @@ uint64_t DfsController::calculateSizeTaken(const std::string &folder) {
         }
     }
 
+    return size;
+}
+
+uint64_t DfsController::calculateFilesSize(const std::string &folder) const {
+    uint64_t size = 0;
+
+    for (std::filesystem::directory_entry const &entry : std::filesystem::directory_iterator(folder)) {
+        if (entry.path().filename() == DFS::Basic::fsMapName) {
+            const std::string actorId = entry.path().parent_path().filename().string();
+            size += DFST::ActorDirFile::totalFileSize(actorId);
+        } else if (entry.is_directory()) {
+            size += calculateFilesSize(entry.path().string());
+        }
+    }
+
+    return size;
+}
+
+uint64_t DfsController::calculateDataAmountStored(const std::string &folder) const {
+    uint64_t size = 0;
+
+    for (std::filesystem::directory_entry const &entry : std::filesystem::directory_iterator(folder)) {
+        if (entry.is_regular_file() && entry.path().extension() == DFSF::Extension) {
+            const std::string actorId = entry.path().parent_path().filename().string();
+            size += DFST::ActorDirFile::dataAmountStoredSize(actorId, entry.path().filename().string());
+        } else if (entry.is_directory()) {
+            size += calculateDataAmountStored(entry.path().string());
+        }
+    }
     return size;
 }
 
@@ -581,6 +618,18 @@ std::string DfsController::extractFragment(boost::interprocess::file_mapping &fm
     boost::interprocess::mapped_region rightRegion(fmapTarget, boost::interprocess::read_only, offset);
     char *rr_ptr = static_cast<char *>(rightRegion.get_address());
     return std::string(rr_ptr, rightRegion.get_size());
+}
+
+void DfsController::sendSizeRequestMsg(const ActorId &actorId) const {
+    DFSP::RequestDfsSize msg { actorId.toStdString() };
+    node.network()->send_message(msg, MessageType::RequestDfsSize, MessageStatus::Request);
+}
+
+void DfsController::sendSizeReponseMsg(const DFS::Packets::RequestDfsSize &msg,
+                                       const std::string &messageId) const {
+    const auto dfsSize = calculateSizeTaken();
+    DFSP::ResponseDfsSize response { .Actor = msg.Actor, .Size = dfsSize };
+    node.network()->send_message(response, MessageType::ResponseDfsSize, MessageStatus::Response, messageId);
 }
 
 void DfsController::requestSync() {
@@ -624,6 +673,7 @@ void DfsController::addDirData(const ActorId &actorId, const std::vector<DFSP::D
 }
 
 void DfsController::requestFile(const ActorId &actorId, const std::string &fileName) {
+    qDebug() << fileName.c_str();
     std::filesystem::remove(DFS_PATH::filePath(actorId, fileName));
     node.network()->send_message(std::pair { actorId, fileName }, MessageType::DfsRequestFile,
                                  MessageStatus::Request);
@@ -724,10 +774,44 @@ void DfsController::fetchFragments(DFS::Packets::RequestFileSegmentMessage &msg,
 
         if (lastFragment) {
             emit uploaded(msg.Actor, msg.FileName);
+            if (std::filesystem::exists(Scripts::folder + "/" + msg.FileName)) {
+                node.network()->send_message(fragment, MessageType::BlockchainCopyScript);
+            }
         } else {
             emit uploadProgress(msg.Actor, msg.FileName, double(totalOffset) / double(fileSize) * 100);
         }
     } while (!lastFragment);
+}
+
+void DfsController::verifyFiles(std::vector<DFS::Packets::VerifyFileMessage> &fileList,
+                                std::string &messageId) {
+    for (auto &file : fileList) {
+        // check file exist
+        std::filesystem::path realFilePath = DFS_PATH::filePath(file.Actor, file.FileName);
+        if (!std::filesystem::exists(realFilePath)) {
+            qDebug() << "File by path" << realFilePath.c_str() << "doesn't exist.";
+            continue;
+        }
+        std::string fileHash = Utils::calcHashForFile(realFilePath);
+        if (fileHash == file.FileHash) {
+            file.Verified = true;
+        }
+    }
+    std::vector<std::string> serializedData = MessagePack::serializeContainer(fileList);
+    node.network()->send_message(serializedData, MessageType::DfsVerifyList, MessageStatus::Response,
+                                 messageId, Config::Net::TypeSend::Focused);
+}
+
+float DfsController::percentVerified(std::vector<DFS::Packets::VerifyFileMessage> &fileList) {
+    float result = 0.0;
+    int countFilesVerified = 0;
+    for (const auto &msg : fileList) {
+        if (msg.Verified) {
+            countFilesVerified++;
+        }
+    }
+    result = ((float)countFilesVerified / (float)fileList.size()) * 100;
+    return result;
 }
 
 std::string DfsController::addFragment(const DFSP::SegmentMessage &msg) {
@@ -1026,5 +1110,12 @@ void ThreadAddFiles::addFile(const Actor<KeyPrivate> &actor, const std::filesyst
     FragmentStorage fs(actor.id(), fileName, fileHash);
     fs.initLocalFile(fileSize);
     fs.initHistoricalChain();
+
+    //    const bool isScript = filePath.extension() == Scripts::wasmExtention;
+    //    std::string scriptPath = "";
+    //    if (isScript) {
+    //        scriptPath = Scripts::folder + "/" + fileName;
+    //        std::filesystem::copy(filePath, scriptPath);
+    //    };
     emit added(msg, filePath.string());
 }
