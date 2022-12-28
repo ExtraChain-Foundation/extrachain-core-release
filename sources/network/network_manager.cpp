@@ -18,11 +18,17 @@
  */
 
 #include "datastorage/dfs/dfs_controller.h"
+#include "managers/data_mining_manager.h"
 #include "managers/extrachain_node.h"
 #include "managers/thread_pool.h"
+#include "managers/tx_manager.h"
 #include "network/upnpconnection.h"
 #include "network/websocket_service.h"
+#include "utils/bignumber_float.h"
+#include <filesystem>
+
 #include <fstream>
+#include <vector>
 
 const QList<SocketService *> &NetworkManager::connections() const {
     return m_connections;
@@ -259,36 +265,82 @@ void NetworkManager::sendMessage(const std::string &serialized_message, Config::
 void NetworkManager::saveToCache(const std::string &serialized_message, Config::Net::TypeSend typeSend,
                                  const std::string &receiver_identifier) {
     std::ofstream file;
-    file.open("tmp/network.cache", std::ios_base::out | std::ios_base::app | std::ios_base::binary);
+    file.open(NetworkCacheFile, std::ios_base::out | std::ios_base::app | std::ios_base::binary);
     if (!file.is_open()) {
         qFatal("[NetworkManager/saveToCache] Error open cache file");
     }
+    auto size = std::filesystem::file_size(NetworkCacheFile);
+    auto typeSendToString = [=](Config::Net::TypeSend ts) -> std::string {
+        switch (ts) {
+        case Config::Net::TypeSend::All:
+            return "All";
+        case Config::Net::TypeSend::Except:
+            return "Except";
+        case Config::Net::TypeSend::Focused:
+            return "Focused";
+        }
+        return "";
+    };
 
-    std::tuple tuple = { serialized_message, typeSend, receiver_identifier };
-    std::string package = MessagePack::serialize(tuple);
-    file << Utils::intToStdString(int(package.length()), 8);
-    file << package;
+    if (size == 0) {
+        std::string serializedMessage = Serialization::serialize(
+            std::vector<std::string> { serialized_message, typeSendToString(typeSend), receiver_identifier });
+        std::string package = Utils::bytesEncodeStdString(serializedMessage);
+        file << Serialization::serialize(std::vector<std::string> { serializedMessage });
+        file.flush();
+        file.close();
+    } else {
+        std::ifstream inputFile;
+        inputFile.open(NetworkCacheFile, std::ios::binary);
+        std::string data;
+        if (inputFile.is_open()) {
+            inputFile >> data;
+        }
+        inputFile.close();
 
-    file.close();
+        std::vector<std::string> list = Serialization::deserialize(data);
+        std::string serializedMessage = Serialization::serialize(
+            std::vector<std::string> { serialized_message, typeSendToString(typeSend), receiver_identifier });
+        list.push_back(serializedMessage);
+        file.close();
+        file.open(NetworkCacheFile, std::ofstream::out | std::ofstream::trunc);
+        file << Serialization::serialize(list);
+        file.close();
+    }
 }
 
 void NetworkManager::sendFromCache() {
     qDebug() << "[NetworkManager] Load from cache";
 
-    QFile file("tmp/network.cache");
+    QFile file(QString::fromStdString(NetworkCacheFile));
     if (!file.exists() || !file.open(QFile::ReadOnly)) {
         return;
     }
 
-    QByteArrayList allPackages = Serialization::deserialize(file.readAll(), 8);
+    std::vector<std::string> allPackages = Serialization::deserialize(file.readAll().toStdString());
     file.close();
     file.remove();
 
-    for (const QByteArray &packageData : qAsConst(allPackages)) {
-        auto [serialized_message, typeSend, receiver_identifier] =
-            MessagePack::deserialize<std::tuple<std::string, Config::Net::TypeSend, std::string>>(
-                packageData);
-        sendMessage(serialized_message, typeSend, receiver_identifier);
+    auto typeSendFromString = [=](std::string typeSendStr) -> Config::Net::TypeSend {
+        if (typeSendStr == "All")
+            return Config::Net::TypeSend::All;
+        else if (typeSendStr == "Except")
+            return Config::Net::TypeSend::Except;
+        else if (typeSendStr == "Focused")
+            return Config::Net::TypeSend::Focused;
+        return Config::Net::TypeSend::All;
+    };
+
+    for (int numberPackage = 0; numberPackage < allPackages.size(); numberPackage++) {
+        const std::vector<std::string> deserializedList = Serialization::deserialize(allPackages[numberPackage]);
+        if(deserializedList.size() < 3) {
+            qWarning("Size deserialized data in not correct");
+            continue;
+        }
+        const std::string deserialized_message = deserializedList[0];
+        const Config::Net::TypeSend typeSend = typeSendFromString(deserializedList[1]);
+        const std::string receiver_identifier = deserializedList[2];
+        sendMessage(deserialized_message, typeSend, receiver_identifier);
     }
 }
 
@@ -304,11 +356,11 @@ bool NetworkManager::isActiveConnectionExists() {
     return false;
 }
 
-bool NetworkManager::checkMsgCount(const QByteArray &msg) {
+bool NetworkManager::checkMsgCount(const std::string &msg) {
     bool flag_result = true;
     bool value = 0;
-    QByteArray hashMsg = Utils::calcHash(msg);
-    QMap<QByteArray, int>::iterator it = msgHashList.find(hashMsg);
+    std::string hashMsg = Utils::calcHash(msg);
+    QMap<std::string, int>::iterator it = msgHashList.find(hashMsg);
 
     if (it == msgHashList.end())
         msgHashList.insert(hashMsg, value);
@@ -326,12 +378,7 @@ bool NetworkManager::checkMsgCount(const QByteArray &msg) {
 }
 
 void NetworkManager::messageReceived(const std::string &message, const std::string &identifier) {
-    //    if (m_messages.contains(identifier)) {
-    //        qDebug() << "[[Network Manager] current message contains in messages by identifier ";
-    //        return;
-    //    }
-
-    if (!checkMsgCount(QByteArray::fromStdString(message))) { // TODO: remove byte array
+    if (!checkMsgCount(message)) {
         qDebug()
             << "[Network Manager] checkMsgCount have returned false: such message has been already added";
         return;
@@ -355,11 +402,15 @@ void NetworkManager::messageReceived(const std::string &message, const std::stri
     //            qDebug() << "[NetworkManager/messageReceived] Verify good";
     //        }
     //    }
-
-    MessageType type = MessagePack::deserialize<MessageType>(msg.substr(1, 1));
-    auto status = MessagePack::deserialize<MessageStatus>(msg.substr(2, 1));
-    auto serialized = msg.substr(40);
-    auto messId = msg.substr(4, 15);
+    MessageBody mb = MessagePack::deserialize<MessageBody>(msg);
+    MessageType type = mb.message_type;
+    MessageStatus status = mb.status;
+    std::string serialized = mb.data;
+    std::string messId = mb.message_id;
+    //    MessageType type = MessagePack::deserialize<MessageType>(msg.substr(1, 1));
+    //    auto status = MessagePack::deserialize<MessageStatus>(msg.substr(2, 1));
+    //    auto serialized = msg.substr(40);
+    //    auto messId = msg.substr(4, 15);
     std::string messageId(messId.begin(), messId.end());
 
     if (status == MessageStatus::Request) {
@@ -378,6 +429,18 @@ void NetworkManager::messageReceived(const std::string &message, const std::stri
 
     // try {
     switch (type) {
+    case MessageType::ResponseDfsSize: {
+        const auto msgStruct = MessagePack::deserialize<DFSP::ResponseDfsSize>(serialized);
+        if (Utils::globalVariableOfDfsSize < msgStruct.Size) {
+            Utils::globalVariableOfDfsSize = msgStruct.Size;
+        }
+        break;
+    }
+    case MessageType::RequestDfsSize: {
+        const auto msgStruct = MessagePack::deserialize<DFSP::RequestDfsSize>(serialized);
+        node.dfs()->sendSizeReponseMsg(msgStruct, messageId);
+        break;
+    }
     case MessageType::NewActor: {
         auto actor = MessagePack::deserialize<Actor<KeyPublic>>(serialized);
         node.actorIndex()->handleNewActor(actor);
@@ -464,6 +527,105 @@ void NetworkManager::messageReceived(const std::string &message, const std::stri
         break;
     }
 
+    case MessageType::DfsVerifyList: {
+        switch (status) {
+        case MessageStatus::NoStatus:
+            break;
+        case MessageStatus::Request: {
+            std::vector<std::string> listMessage =
+                MessagePack::deserialize<std::vector<std::string>>(serialized);
+            std::vector<DFSP::VerifyFileMessage> listVerifiedMessage =
+                MessagePack::deserializeContainer<DFSP::VerifyFileMessage>(listMessage);
+            node.dfs()->verifyFiles(listVerifiedMessage, messageId);
+            break;
+        }
+        case MessageStatus::Response: {
+            std::vector<std::string> listMessage =
+                MessagePack::deserialize<std::vector<std::string>>(serialized);
+            std::vector<DFSP::VerifyFileMessage> listVerifiedMessage =
+                MessagePack::deserializeContainer<DFSP::VerifyFileMessage>(listMessage);
+            float percentVerified = node.dfs()->percentVerified(listVerifiedMessage);
+            break;
+        }
+        }
+        break;
+    }
+
+    case MessageType::DfsState: {
+        Transaction reward = node.dataMiningManager()->makeRewardTx(mb);
+        this->send_message(reward, MessageType::BlockchainTransaction);
+        break;
+    }
+
+    case MessageType::BlockchainGenesisBlock: {
+        qDebug() << "BlockchainGenesisBlock";
+        auto genesisBlock = MessagePack::deserialize<GenesisBlock>(serialized);
+        node.blockchain()->addGenBlockToBlockchain(genesisBlock);
+        break;
+    }
+    case MessageType::BlockchainNewBlock: {
+        qDebug() << "BlockchainNewBlock";
+
+        auto block = MessagePack::deserialize<Block>(serialized);
+        node.blockchain()->addBlockToBlockchain(block);
+        break;
+    }
+
+    case MessageType::BlockchainTransaction: {
+        qDebug() << "BlockchainTransaction";
+        Transaction transaction = MessagePack::deserialize<Transaction>(serialized);
+        if (!(transaction.getData().empty()) && (transaction.getTypeTx() != TypeTx::RewardTransaction)) {
+            TransactionData transactionData =
+                MessagePack::deserialize<TransactionData>(transaction.getData());
+            qDebug() << "run code from " << transactionData.path.c_str()
+                     << "with hash: " << transactionData.hash.c_str();
+        }
+        node.txManager()->addTransaction(transaction);
+        break;
+    }
+
+    case MessageType::BlockchainCopyScript: {
+        auto msg = MessagePack::deserialize<DFSP::RequestFileSegmentMessage>(serialized);
+        std::string fromPath = DFS::Basic::fsActrRoot + "/" + msg.Actor + "/" + msg.FileName;
+        std::string toPath = Scripts::folder + "/" + msg.FileName;
+        std::filesystem::copy_file(fromPath, toPath);
+        break;
+    }
+
+    case MessageType::FragmentDataInfo: {
+        auto msg = MessagePack::deserialize<DFSF::FragmentsInfo>(serialized);
+        msg.print();
+        break;
+    }
+
+    case MessageType::FragmentsDataListInfo: {
+        auto fragmentsInfoList = MessagePack::deserialize<std::vector<DFSF::FragmentsInfo>>(serialized);
+        qDebug() << "Recieved fragment data info from list";
+        for (const auto &msg : fragmentsInfoList) {
+            msg.print();
+        }
+        break;
+    }
+
+    case MessageType::BlockchainCoinReward: {
+        auto coinReward = MessagePack::deserialize<DFSR::CoinReward>(serialized);
+        switch (status) {
+        case MessageStatus::NoStatus:
+            break;
+        case MessageStatus::Request: {
+            node.blockchain()->sendCoinReward(coinReward.Actor, coinReward.Coin);
+            break;
+        }
+        case MessageStatus::Response: {
+            node.blockchain()->sendCoinReward(coinReward.Actor, coinReward.Coin, messageId);
+            break;
+        }
+        default:
+            break;
+        }
+        break;
+    }
+
     default:
         qFatal("[NetworkManager/messageReceived] Not supported message type: %d", int(type));
         break;
@@ -471,8 +633,7 @@ void NetworkManager::messageReceived(const std::string &message, const std::stri
     // } catch (std::exception e) { qFatal("[NetworkManager/messageReceived] Error deserialize"); }
 }
 
-void NetworkManager::removeWsConnection() //
-{
+void NetworkManager::removeWsConnection() {
     if (QObject::sender() == nullptr)
         return;
 

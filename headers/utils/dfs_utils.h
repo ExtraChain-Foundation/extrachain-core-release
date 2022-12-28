@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "utils/bignumber.h"
 #include "utils/db_connector.h"
 #include <boost/algorithm/string/replace.hpp>
 #include <msgpack.hpp>
@@ -46,6 +47,8 @@ T stdStringBytesToType(std::string value) {
 }
 namespace Utils {
 std::string platformDelimeter();
+
+inline static uint64_t globalVariableOfDfsSize = 0;
 }
 
 namespace DFS {
@@ -60,9 +63,23 @@ namespace Basic {
 
     static const uint64_t encSectionSize = 256;
     static std::wstring separator = std::wstring(1, std::filesystem::path::preferred_separator);
+    static const int miningReward = 1;
 }
 
 namespace Packets {
+    struct ResponseDfsSize {
+        std::string Actor;
+        uint64_t Size;
+
+        MSGPACK_DEFINE(Actor, Size)
+    };
+
+    struct RequestDfsSize {
+        std::string Actor;
+
+        MSGPACK_DEFINE(Actor)
+    };
+
     struct AddFileMessage {
         std::string Actor;
         std::string FileName;
@@ -131,17 +148,62 @@ namespace Packets {
         uint64_t lastModified;
         MSGPACK_DEFINE(fileHash, fileHashPrev, filePath, fileName, fileSize, lastModified)
     };
+
+    struct VerifyFileMessage {
+        std::string Actor;
+        std::string FileHash;
+        std::string FileName;
+        bool Verified = false;
+        uint64_t Size;
+        MSGPACK_DEFINE(Actor, FileName, FileHash, Verified, Size)
+    };
+
+    enum StateMessageType {
+        base = 0
+    };
+
+    struct StateMessage {
+        StateMessageType StateTypeMessage;
+        uint64_t DataAmountStored;
+        double Coefficient = 0.5;
+        double CoinProducedForNode = 0.0;
+        uint64_t CoinProductionAlgorithmTickBlocks = 100;
+        float BlockProductionRate = 0.5;
+        uint64_t CoinProductionAlgorithmTickPerHour = 18;
+
+        MSGPACK_DEFINE(StateTypeMessage, DataAmountStored, Coefficient, CoinProducedForNode,
+                       CoinProductionAlgorithmTickBlocks, BlockProductionRate,
+                       CoinProductionAlgorithmTickPerHour)
+    };
 }
 namespace Fragments {
     static const std::string Extension = ".storj";
     static const std::string TableNameFragments = "Fragments";
     static const std::string CreateTableQueryFragments = "CREATE TABLE IF NOT EXISTS " + TableNameFragments
         + "("
-          "pos        INTEGER PRIMARY KEY NOT NULL,"
-          "storedPos  INTEGER             NOT NULL,"
-          "size       INTEGER             NOT NULL"
+          "pos        INTEGER PRIMARY KEY NOT NULL, "
+          "storedPos  INTEGER             NOT NULL, "
+          "size       INTEGER             NOT NULL, "
+          "fragHash   TEXT                NOT NULL"
           ");";
 
+    struct FragmentsInfo {
+        std::string actor;
+        std::string fileHash;
+        std::string filePath;
+        uint64_t fileSize;
+        std::list<std::pair<int, int>> fragmentPositionList;
+
+        void print() const {
+            qDebug() << "actor: [" << actor.c_str() << "]"
+                     << "fileHash" << fileHash.c_str() << "]"
+                     << "filePath" << filePath.c_str() << "]";
+            for (const auto &pair : fragmentPositionList) {
+                qDebug() << pair.first << pair.second;
+            }
+        }
+        MSGPACK_DEFINE(actor, fileHash, filePath, fileSize, fragmentPositionList)
+    };
 }
 namespace Historical {
     struct FileChange {
@@ -166,6 +228,15 @@ namespace Historical {
           "hash       TEXT                NOT NULL "
           ");";
 }
+namespace Reward {
+    static const BigNumber coinProductionAlgorithmTick = BigNumber("100", 10);
+    struct CoinReward {
+        std::string Actor;
+        int Coin;
+        MSGPACK_DEFINE(Actor, Coin)
+    };
+}
+
 namespace Tables {
     namespace ActorDirFile {
         static const std::string TableName = "FilesTable";
@@ -181,10 +252,13 @@ namespace Tables {
         std::vector<DBRow> getFileDataByHash(DBConnector *db, std::string hash);
         std::vector<DBRow> getFileDataByName(DBConnector *db, std::string name);
         std::string getLastName(DBConnector &db);
+        int totalFileSize(const std::string &actorId);
+        uint64_t dataAmountStoredSize(const std::string &actorId, const std::string &storjName);
 
         // TODO: optional
         DBConnector actorDbConnector(const std::string &actorId);
         std::filesystem::path actorDbPath(const std::string &actorId);
+        std::filesystem::path storjDbPath(const std::string &actorId, const std::string &storjName);
         DFS::Packets::DirRow getDirRow(const std::string &actorId, const std::string &fileHash);
         std::vector<DFS::Packets::DirRow> getDirRows(const std::string &actorId, uint64_t lastModified = 0);
         bool addDirRows(const std::string &actorId, const std::vector<DFS::Packets::DirRow> &dirRows);
@@ -218,6 +292,21 @@ namespace Path {
     std::filesystem::path filePath(const ActorId &actorId, const std::string &fileName);
 }
 
+namespace Balances {
+    const std::string balanceDbPath = "blockchain/balance.db";
+    const std::string balancesTableName = "balances";
+    const std::string createBalanceTable = "CREATE TABLE IF NOT EXISTS balances("
+                                           "actor_id       TEXT   NOT NULL, "
+                                           "balance       TEXT   NOT NULL, "
+                                           "last_update    TEXT   NOT NULL );";
+    const std::string loadBalancesQuery = "SELECT * FROM balances";
+
+    struct Balance {
+        std::string Actor;
+        std::string Balance;
+    };
+}
+
 enum class Encryption {
     Public = 0,
     Encrypted = 1
@@ -230,6 +319,9 @@ namespace STDFS = std::filesystem;
 namespace DFSHC = DFS::Historical;
 namespace DFSB = DFS::Basic;
 namespace DFS_PATH = DFS::Path;
+namespace DFSR = DFS::Reward;
 
 MSGPACK_ADD_ENUM(DFS::Packets::SegmentMessageType)
+MSGPACK_ADD_ENUM(DFS::Packets::StateMessageType)
+
 #endif // DFS_UTILS_H
